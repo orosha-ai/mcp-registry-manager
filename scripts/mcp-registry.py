@@ -30,6 +30,14 @@ DB_PATH = Path.home() / ".openclaw" / "workspace" / "mcp-registry-manager" / "re
 GITHUB_API = "https://api.github.com/search/repositories?q=topic:mcp-server"
 AWESOME_MCP_URL = "https://raw.githubusercontent.com/awesome-mcp-servers/awesome-mcp-servers/main/README.md"
 
+# Local MCP config paths to scan
+LOCAL_MCP_CONFIGS = [
+    Path.home() / ".config" / "claude" / "mcp_servers.json",
+    Path.home() / ".config" / "mcp" / "servers.json",
+    Path.home() / ".openclaw" / "config" / "mcp_servers.json",
+    Path.home() / ".claude" / "mcp_servers.json",
+]
+
 class MCPServer:
     """Represent an MCP server with metadata."""
     
@@ -78,6 +86,7 @@ class MCPRegistry:
             quality_score REAL,
             metadata TEXT,
             installed INTEGER DEFAULT 0,
+            local_path TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
@@ -87,26 +96,70 @@ class MCPRegistry:
         """Discover MCP servers from GitHub."""
         print(f"🔍 Discovering from GitHub...")
         servers = []
-        
+
         try:
             response = requests.get(f"{GITHUB_API}&per_page={limit}", timeout=10)
             data = response.json()
-            
+
             for repo in data.get('items', []):
                 name = repo['full_name']
                 url = repo['html_url']
                 description = repo.get('description', '')
-                
+
                 server = MCPServer(name, url, description)
                 server.metadata['stars'] = repo.get('stargazers_count', 0)
                 server.metadata['updated'] = repo.get('updated_at', '')
                 servers.append(server)
-                
+
             print(f"✓ Found {len(servers)} servers on GitHub")
-            
+
         except Exception as e:
             print(f"✗ GitHub discovery failed: {e}")
-            
+
+        return servers
+
+    def discover_local(self) -> List[MCPServer]:
+        """Discover MCP servers from local config files."""
+        print(f"🔍 Discovering local MCP servers...")
+
+        servers = []
+
+        for config_path in LOCAL_MCP_CONFIGS:
+            if not config_path.exists():
+                continue
+
+            print(f"  Checking {config_path}...")
+
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config_data = json.load(f)
+
+                # Parse different config formats
+                mcp_servers = config_data.get('mcpServers', {})
+                if not mcp_servers:
+                    mcp_servers = config_data.get('servers', {})
+
+                for server_name, server_config in mcp_servers.items():
+                    url = server_config.get('url', server_config.get('command', ''))
+                    description = server_config.get('description', f"Local MCP server: {server_name}")
+
+                    server = MCPServer(f"local/{server_name}", url, description, category="local")
+                    server.metadata['local_path'] = str(config_path)
+                    server.metadata['config'] = server_config
+                    server.quality_score = 1.0  # Local servers get max quality
+
+                    servers.append(server)
+
+                print(f"  ✓ Found {len(mcp_servers)} servers")
+
+            except Exception as e:
+                print(f"  ✗ Failed to read {config_path}: {e}")
+
+        if servers:
+            print(f"✓ Found {len(servers)} local MCP servers")
+        else:
+            print("✓ No local MCP servers found")
+
         return servers
     
     def quality_score(self, server: MCPServer) -> float:
@@ -229,12 +282,104 @@ class MCPRegistry:
         """Mark a server as uninstalled."""
         cursor = self.conn.cursor()
         cursor.execute("UPDATE servers SET installed=0 WHERE name=?", (server_name,))
-        
+
         if cursor.rowcount > 0:
             print(f"✓ Uninstalled: {server_name}")
             self.conn.commit()
         else:
             print(f"✗ Server not found: {server_name}")
+
+    def health_check(self, server_name: str) -> Dict:
+        """Check health of a local MCP server."""
+        print(f"🏥 Checking health: {server_name}...")
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT name, url, metadata FROM servers WHERE name=?", (server_name,))
+        row = cursor.fetchone()
+
+        if not row:
+            print(f"✗ Server not found: {server_name}")
+            return {}
+
+        name, url, metadata_json = row
+        metadata = json.loads(metadata_json)
+
+        # Basic health checks
+        health = {
+            'name': name,
+            'url': url,
+            'status': 'unknown',
+            'checks': {}
+        }
+
+        # Check 1: URL exists (for local servers)
+        if url.startswith('stdio:'):
+            health['checks']['url_valid'] = True
+            health['checks']['url_type'] = 'stdio'
+        elif url.startswith('sse:'):
+            health['checks']['url_valid'] = True
+            health['checks']['url_type'] = 'sse'
+        else:
+            # For http/ws URLs, try to connect (simplified)
+            health['checks']['url_valid'] = len(url) > 0
+            health['checks']['url_type'] = 'remote'
+
+        # Check 2: Config has required fields
+        config = metadata.get('config', {})
+        if 'command' in config or 'url' in config:
+            health['checks']['config_valid'] = True
+        else:
+            health['checks']['config_valid'] = False
+
+        # Check 3: Has description
+        health['checks']['has_description'] = bool(metadata.get('description', ''))
+
+        # Overall status
+        if all(health['checks'].values()):
+            health['status'] = 'healthy'
+        elif health['checks']['config_valid']:
+            health['status'] = 'degraded'
+        else:
+            health['status'] = 'unhealthy'
+
+        # Print summary
+        print(f"\n  Status: {health['status'].upper()}")
+        print(f"  URL: {url}")
+        print(f"  Type: {health['checks'].get('url_type', 'unknown')}")
+        for check, result in health['checks'].items():
+            status = "✓" if result else "✗"
+            print(f"  {status} {check}: {result}")
+        print()
+
+        return health
+
+    def health_check_all(self) -> List[Dict]:
+        """Check health of all installed servers."""
+        print(f"🏥 Health check for all servers...")
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT name FROM servers WHERE installed=1")
+        rows = cursor.fetchall()
+
+        if not rows:
+            print("✗ No installed servers found")
+            return []
+
+        results = []
+        for row in rows:
+            server_name = row[0]
+            health = self.health_check(server_name)
+            if health:
+                results.append(health)
+
+        # Summary
+        healthy = sum(1 for r in results if r['status'] == 'healthy')
+        degraded = sum(1 for r in results if r['status'] == 'degraded')
+        unhealthy = sum(1 for r in results if r['status'] == 'unhealthy')
+
+        print(f"\n📊 Summary: {healthy} healthy, {degraded} degraded, {unhealthy} unhealthy")
+
+        return results
     
     def list_servers(self, installed_only: bool = False, sort_by: str = "quality") -> List[Dict]:
         """List servers in registry."""
@@ -281,7 +426,8 @@ class MCPRegistry:
 
 def main():
     parser = argparse.ArgumentParser(description="MCP Registry Manager v0.1")
-    parser.add_argument("--discover", action="store_true", help="Discover MCP servers")
+    parser.add_argument("--discover", action="store_true", help="Discover MCP servers from GitHub")
+    parser.add_argument("--discover-local", action="store_true", help="Discover local MCP servers from config files")
     parser.add_argument("--search", type=str, help="Semantic search query")
     parser.add_argument("--top", type=int, default=5, help="Top N results for search")
     parser.add_argument("--score", type=str, help="Get quality score for server")
@@ -291,17 +437,23 @@ def main():
     parser.add_argument("--installed", action="store_true", help="List only installed servers")
     parser.add_argument("--sort", type=str, default="quality", choices=["quality", "name"], help="Sort by")
     parser.add_argument("--export", type=str, help="Export registry to JSON")
+    parser.add_argument("--health-check", type=str, help="Check health of a specific server")
+    parser.add_argument("--health-all", action="store_true", help="Check health of all installed servers")
     parser.add_argument("--db", type=str, default=str(DB_PATH), help="Registry database path")
-    
+
     args = parser.parse_args()
-    
+
     registry = MCPRegistry(db_path=Path(args.db))
-    
+
     try:
         if args.discover:
             servers = registry.discover_github()
             registry.add_servers(servers)
-        
+
+        if args.discover_local:
+            servers = registry.discover_local()
+            registry.add_servers(servers)
+
         if args.search:
             results = registry.semantic_search(args.search, args.top)
             print(f"\n🔎 Results for '{args.search}':\n")
@@ -312,7 +464,7 @@ def main():
                 if result['description']:
                     print(f"   {result['description']}")
                 print()
-        
+
         if args.score:
             cursor = registry.conn.cursor()
             cursor.execute("SELECT name, quality_score FROM servers WHERE name=?", (args.score,))
@@ -322,13 +474,13 @@ def main():
                 print(f"📊 Quality Score for {name}: {quality}/1.0")
             else:
                 print(f"✗ Server not found: {args.score}")
-        
+
         if args.install:
             registry.install(args.install)
-        
+
         if args.uninstall:
             registry.uninstall(args.uninstall)
-        
+
         if args.list:
             servers = registry.list_servers(installed_only=args.installed, sort_by=args.sort)
             print(f"\n📋 MCP Servers ({len(servers)} total):\n")
@@ -339,10 +491,16 @@ def main():
                 if server['description']:
                     print(f"  {server['description']}")
                 print()
-        
+
         if args.export:
             registry.export_registry(args.export)
-            
+
+        if args.health_check:
+            registry.health_check(args.health_check)
+
+        if args.health_all:
+            registry.health_check_all()
+
     finally:
         registry.close()
 
